@@ -1,0 +1,12 @@
+host/target/
+viewer/.dart_tool/
+viewer/build/
+viewer/.flutter-plugins*
+viewer/.metadata
+viewer/android/.gradle/
+viewer/android/build/
+viewer/android/app/build/
+viewer/android/local.properties
+*.exe
+*.apk
+*.tar.gz

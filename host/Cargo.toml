@@ -1,0 +1,24 @@
+[package]
+name = "remote-viewer-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-capture = "2.0.1"
+
+[[bin]]
+name = "RemoteViewerHost"
+path = "src/bin/service.rs"
+
+[[bin]]
+name = "RemoteViewerCapture"
+path = "src/bin/agent.rs"
