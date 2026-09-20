@@ -24,6 +24,35 @@ For this prototype, the Android release build uses Flutter's generated debug sig
 
 The Android manifest in this repository grants Internet access for LAN TCP connections. The generated platform scaffolding supplies `MainActivity` and desktop launcher files.
 
+## CI/CD and downloads
+
+GitHub Actions builds all three targets on pull requests, pushes to `main`, and manual runs. Open a successful **Actions > CI** run and download its artifacts to test the Windows installer, Linux bundle, or debug-signed Android APK. CI artifacts are retained for 14 days and are intended for testing, not permanent distribution.
+
+Pushing a semantic version tag creates a permanent GitHub Release containing:
+
+- `RVHost-Windows-x64-Setup.exe`
+- `RemoteViewer-Linux-x64.tar.gz`
+- `RemoteViewer-Android.apk`
+- `SHA256SUMS.txt`
+
+The Android release asset is intentionally a debug build signed with Flutter's generated debug key because this is a personal-distribution tool. It is suitable for direct sideloading, but not for Google Play publishing or a broadly distributed production app.
+
+Create and publish a release with:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The same workflow can be started manually for an existing `vMAJOR.MINOR.PATCH` tag. Release downloads appear at `https://github.com/arslan-qamar/rv/releases/latest`; stable direct links can use `/releases/latest/download/<asset-name>`.
+
+For this project, GitHub Releases are the best publishing option: assets are attached to version tags, remain available until removed, and have stable download links. The other GitHub-hosted choices serve different purposes:
+
+- **Actions artifacts** are useful for branch and pull-request testing, but they expire and downloaders need repository read access.
+- **GitHub Pages** can provide a friendly download website that links to Release assets; it should not be the binary store itself.
+- **GitHub Packages** is designed for package registries and container images, not desktop installers or standalone APK downloads.
+- **Committing binaries or using Git LFS** makes repository history and cloning heavier; Releases are a better fit for generated installers.
+
 ## Install and use
 
 Run the Windows installer as an administrator, enter a device name, port and password, then finish. The installer writes an Argon2id password hash in `password.hash` with service/admin access and a random local agent token in `config.json` with interactive-user read access, both under `%PROGRAMDATA%\RVHost`. It creates an automatic `RVHost` service, registers `RVCapture` under the machine-wide Run key, adds an inbound Windows Firewall rule for the configured TCP port, and starts both components. The rule applies to every Windows network profile so VM adapters work, while limiting remote addresses to the local subnet. `RVCapture` launches again at each interactive logon.

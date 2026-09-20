@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vMAJOR.MINOR.PATCH tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - id: tag
+        name: Validate semantic version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must match vMAJOR.MINOR.PATCH (for example, v1.2.3)." >&2
+            exit 1
+          fi
+          echo "value=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  windows-installer:
+    name: Windows host installer
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install NSIS
+        run: choco install nsis --no-progress -y
+      - name: Build installer
+        shell: pwsh
+        run: ./build-windows.ps1
+      - name: Name release asset
+        shell: pwsh
+        run: Copy-Item installer/RVHostSetup.exe RVHost-Windows-x64-Setup.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: RVHost-Windows-x64-Setup.exe
+          if-no-files-found: error
+
+  linux-viewer:
+    name: Linux viewer
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - name: Install Linux desktop dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Build Linux bundle
+        working-directory: viewer
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter build linux --release
+          mkdir -p dist
+          tar -C build/linux/x64/release -czf dist/RemoteViewer-Linux-x64.tar.gz bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: viewer/dist/RemoteViewer-Linux-x64.tar.gz
+          if-no-files-found: error
+
+  android-viewer:
+    name: Android viewer (debug-signed)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Build debug-signed APK
+        working-directory: viewer
+        run: |
+          flutter pub get
+          flutter build apk --debug
+      - name: Name release asset
+        run: cp viewer/build/app/outputs/flutter-apk/app-debug.apk RemoteViewer-Android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: RemoteViewer-Android.apk
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validate, windows-installer, linux-viewer, android-viewer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt
+      - name: Create GitHub Release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes \
+              --title "$RELEASE_TAG"
+          fi

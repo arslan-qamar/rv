@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    name: Host protocol tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --manifest-path host/Cargo.toml --lib --locked
+
+  windows-installer:
+    name: Windows host installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install NSIS
+        run: choco install nsis --no-progress -y
+      - name: Build installer
+        shell: pwsh
+        run: ./build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RVHost-Windows-x64-Setup
+          path: installer/RVHostSetup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-viewer:
+    name: Linux viewer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux desktop dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve dependencies
+        working-directory: viewer
+        run: flutter pub get
+      - name: Analyze
+        working-directory: viewer
+        run: flutter analyze
+      - name: Build Linux bundle
+        working-directory: viewer
+        run: flutter build linux --release
+      - name: Package Linux bundle
+        working-directory: viewer
+        run: |
+          mkdir -p dist
+          tar -C build/linux/x64/release -czf dist/RemoteViewer-Linux-x64.tar.gz bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemoteViewer-Linux-x64
+          path: viewer/dist/RemoteViewer-Linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  android-viewer:
+    name: Android viewer (debug)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve dependencies
+        working-directory: viewer
+        run: flutter pub get
+      - name: Build debug APK
+        working-directory: viewer
+        run: flutter build apk --debug
+      - name: Name APK
+        run: cp viewer/build/app/outputs/flutter-apk/app-debug.apk RemoteViewer-Android-debug.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemoteViewer-Android-debug
+          path: RemoteViewer-Android-debug.apk
+          if-no-files-found: error
+          retention-days: 14
