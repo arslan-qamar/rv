@@ -81,7 +81,7 @@ class RemoteConnection extends ChangeNotifier {
       switch (type) {
         case authSuccess:
           connected = true;
-          status = 'Connected';
+          status = 'Connected • waiting for Windows desktop';
           changed = true;
           break;
         case authFailure:
@@ -138,6 +138,7 @@ class RemoteConnection extends ChangeNotifier {
     _pending = Uint8List.fromList(data.sublist(offset));
     if (newest != null) {
       jpeg = newest;
+      status = 'Connected';
       changed = true;
     }
     final now = DateTime.now();

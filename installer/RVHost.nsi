@@ -5,9 +5,9 @@ Unicode true
 !ifndef BUILDTARGET
   !define BUILDTARGET "x86_64-pc-windows-msvc"
 !endif
-Name "Remote Viewer Host"
-OutFile "RemoteViewerHostSetup.exe"
-InstallDir "$PROGRAMFILES64\RemoteViewerHost"
+Name "RVHost"
+OutFile "RVHostSetup.exe"
+InstallDir "$PROGRAMFILES64\RVHost"
 RequestExecutionLevel admin
 ShowInstDetails show
 Var DeviceField
@@ -84,15 +84,22 @@ Function ConfigureLeave
 FunctionEnd
 
 Section "Install"
+  ; Permit repair/upgrade over an existing MVP installation.
+  nsExec::ExecToLog 'sc.exe stop RVHost'
+  nsExec::ExecToLog 'taskkill.exe /F /IM RVCapture.exe'
+  nsExec::ExecToLog 'taskkill.exe /F /IM RVHost.exe'
+  nsExec::ExecToLog 'sc.exe delete RVHost'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost"'
+  Sleep 750
   SetOutPath "$INSTDIR"
-  File "..\host\target\${BUILDTARGET}\release\RemoteViewerHost.exe"
-  File "..\host\target\${BUILDTARGET}\release\RemoteViewerCapture.exe"
+  File "..\host\target\${BUILDTARGET}\release\RVHost.exe"
+  File "..\host\target\${BUILDTARGET}\release\RVCapture.exe"
   InitPluginsDir
   StrCpy $TempConfig "$PLUGINSDIR\setup-input.txt"
   FileOpen $0 $TempConfig w
   FileWrite $0 "$DeviceName$\r$\n$PortValue$\r$\n$PasswordValue$\r$\n"
   FileClose $0
-  nsExec::ExecToLog '"$INSTDIR\RemoteViewerHost.exe" --init-file "$TempConfig"'
+  nsExec::ExecToLog '"$INSTDIR\RVHost.exe" --init-file "$TempConfig"'
   Pop $0
   Delete $TempConfig
   ${If} $0 != 0
@@ -100,73 +107,81 @@ Section "Install"
     Abort
   ${EndIf}
   SetShellVarContext all
-  nsExec::ExecToLog 'icacls "$APPDATA\RemoteViewerHost" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)R"'
+  nsExec::ExecToLog 'icacls "$APPDATA\RVHost" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)R"'
   Pop $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "Could not secure configuration directory."
     Abort
   ${EndIf}
-  nsExec::ExecToLog 'icacls "$APPDATA\RemoteViewerHost\password.hash" /inheritance:r /remove:g "*S-1-5-32-545" /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F"'
+  nsExec::ExecToLog 'icacls "$APPDATA\RVHost\password.hash" /inheritance:r /remove:g "*S-1-5-32-545" /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F"'
   Pop $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "Could not secure password hash."
     Abort
   ${EndIf}
-  nsExec::ExecToLog 'sc.exe create RemoteViewerHost binPath= "$INSTDIR\RemoteViewerHost.exe" start= auto DisplayName= "Remote Viewer Host"'
+  nsExec::ExecToLog 'sc.exe create RVHost binPath= "$INSTDIR\RVHost.exe" start= auto DisplayName= "RVHost"'
   Pop $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "Could not create Windows Service. Error code: $0"
     Abort
   ${EndIf}
-  nsExec::ExecToLog 'sc.exe failure RemoteViewerHost reset= 86400 actions= restart/5000/restart/5000/restart/5000'
+  nsExec::ExecToLog 'sc.exe failure RVHost reset= 86400 actions= restart/5000/restart/5000/restart/5000'
   Pop $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "Could not configure service recovery."
     Abort
   ${EndIf}
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "RemoteViewerCapture" '"$INSTDIR\RemoteViewerCapture.exe"'
-  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Remote Viewer Host" dir=in action=allow protocol=TCP localport=$PortValue program="$INSTDIR\RemoteViewerHost.exe" profile=private'
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "RVCapture" '"$INSTDIR\RVCapture.exe"'
+  ; QEMU and other VM adapters are frequently classified as Public. Apply the
+  ; rule to every profile, but only accept peers on directly reachable subnets.
+  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="RVHost" dir=in action=allow protocol=TCP localport=$PortValue program="$INSTDIR\RVHost.exe" profile=any remoteip=localsubnet enable=yes'
   Pop $0
   ${If} $0 != 0
-    MessageBox MB_ICONSTOP "Could not add private-network firewall rule."
+    MessageBox MB_ICONSTOP "Could not add the LAN firewall rule."
     Abort
   ${EndIf}
-  nsExec::ExecToLog 'sc.exe start RemoteViewerHost'
+  nsExec::ExecToLog 'sc.exe start RVHost'
   Pop $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "Could not start Windows Service. Error code: $0"
     Abort
   ${EndIf}
   Sleep 1000
-  nsExec::ExecToStack 'cmd.exe /C "sc.exe query RemoteViewerHost | findstr RUNNING"'
+  nsExec::ExecToStack 'cmd.exe /C "sc.exe query RVHost | findstr RUNNING"'
   Pop $0
   Pop $1
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "Windows Service verification failed."
     Abort
   ${EndIf}
-  Exec '"$INSTDIR\RemoteViewerCapture.exe"'
+  Exec '"$INSTDIR\RVCapture.exe"'
   WriteUninstaller "$INSTDIR\Uninstall.exe"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RemoteViewerHost" "DisplayName" "Remote Viewer Host"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RemoteViewerHost" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RVHost" "DisplayName" "RVHost"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RVHost" "UninstallString" '"$INSTDIR\Uninstall.exe"'
 SectionEnd
 
 Function FinishPage
   nsDialogs::Create 1018
   Pop $0
-  ${NSD_CreateLabel} 0 0 100% 110u "Remote Viewer Host installed successfully.$\r$\n$\r$\nDevice: $DeviceName$\r$\nPort: $PortValue$\r$\nMode: VIEW ONLY$\r$\n$\r$\nThe Host starts automatically when Windows starts. The capture agent starts when a user logs in."
+  ${NSD_CreateLabel} 0 0 100% 110u "RVHost installed successfully.$\r$\n$\r$\nDevice: $DeviceName$\r$\nPort: $PortValue$\r$\nMode: VIEW ONLY$\r$\n$\r$\nRVHost starts automatically when Windows starts. RVCapture starts when a user logs in."
   Pop $0
   nsDialogs::Show
 FunctionEnd
 
 Section "Uninstall"
-  nsExec::ExecToLog 'sc.exe stop RemoteViewerHost'
-  nsExec::ExecToLog 'sc.exe delete RemoteViewerHost'
-  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="Remote Viewer Host"'
-  DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "RemoteViewerCapture"
-  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RemoteViewerHost"
-  Delete "$INSTDIR\RemoteViewerHost.exe"
-  Delete "$INSTDIR\RemoteViewerCapture.exe"
+  ; Remove autostart before terminating the interactive capture agent so it
+  ; cannot be relaunched during uninstall.
+  DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "RVCapture"
+  nsExec::ExecToLog 'taskkill.exe /F /IM RVCapture.exe'
+  nsExec::ExecToLog 'sc.exe stop RVHost'
+  Sleep 500
+  nsExec::ExecToLog 'taskkill.exe /F /IM RVHost.exe'
+  nsExec::ExecToLog 'sc.exe delete RVHost'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost"'
+  Sleep 500
+  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RVHost"
+  Delete "$INSTDIR\RVHost.exe"
+  Delete "$INSTDIR\RVCapture.exe"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
 SectionEnd

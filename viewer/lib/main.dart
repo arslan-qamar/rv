@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'protocol.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   PaintingBinding.instance.imageCache.maximumSize = 2;
   runApp(const RemoteViewerApp());
 }
@@ -102,7 +103,17 @@ class _ViewerPageState extends State<ViewerPage> {
                     color: Colors.black,
                     child: Center(
                       child: connection.jpeg == null
-                          ? const CircularProgressIndicator()
+                          ? Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const CircularProgressIndicator(),
+                                const SizedBox(height: 16),
+                                Text(
+                                  connection.status,
+                                  style: const TextStyle(color: Colors.white),
+                                ),
+                              ],
+                            )
                           : InteractiveViewer(
                               transformationController: transform,
                               minScale: 1,

@@ -4,7 +4,8 @@ use anyhow::{bail, Result};
 use image::{codecs::jpeg::JpegEncoder, ColorType};
 use remote_viewer_host::*;
 use std::{
-    net::TcpStream,
+    net::{Shutdown, TcpStream},
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -13,29 +14,66 @@ use windows_capture::{
     monitor::Monitor,
 };
 
-fn capture(mut stream: TcpStream, quality: u8, fps: u8) -> Result<()> {
-    let monitor = Monitor::primary()?;
-    let mut duplication =
-        DxgiDuplicationApi::new_options(monitor, &[DxgiDuplicationFormat::Bgra8])?;
+struct ControlState {
+    active: bool,
+    connected: bool,
+}
+type Control = Arc<(Mutex<ControlState>, Condvar)>;
+
+fn capture(stream: &mut TcpStream, quality: u8, fps: u8, control: &Control) -> Result<()> {
     let interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut previous = Instant::now() - interval;
-    let mut heartbeat = Instant::now();
+    let mut duplication = None;
     let mut packed = Vec::new();
+    let mut previous_bgra = Vec::new();
     let mut rgb = Vec::new();
     loop {
-        let mut frame = match duplication.acquire_next_frame(33) {
+        {
+            let (lock, changed) = &**control;
+            let state = lock.lock().unwrap();
+            let state = changed
+                .wait_while(state, |state| state.connected && !state.active)
+                .unwrap();
+            if !state.connected {
+                bail!("service disconnected")
+            }
+        }
+        if duplication.is_none() {
+            let monitor = Monitor::primary()?;
+            duplication = Some(DxgiDuplicationApi::new_options(
+                monitor,
+                &[DxgiDuplicationFormat::Bgra8],
+            )?);
+            previous_bgra.clear();
+            previous = Instant::now() - interval;
+        }
+        let is_active = || control.0.lock().unwrap().active;
+        let mut frame = match duplication.as_mut().unwrap().acquire_next_frame(33) {
             Ok(frame) => frame,
-            Err(CaptureError::Timeout) => {
-                if heartbeat.elapsed() >= Duration::from_secs(2) {
-                    write_message(&mut stream, PING, &[])?;
-                    heartbeat = Instant::now();
-                }
+            Err(CaptureError::Timeout) => continue,
+            Err(CaptureError::AccessLost) => {
+                duplication = None;
+                thread::sleep(Duration::from_millis(250));
                 continue;
             }
-            Err(CaptureError::AccessLost) => bail!("desktop capture access lost"),
             Err(error) => return Err(error.into()),
         };
-        if previous.elapsed() < interval {
+        if !is_active() {
+            drop(frame);
+            duplication = None;
+            previous_bgra.clear();
+            continue;
+        }
+        let remaining = interval.saturating_sub(previous.elapsed());
+        if !remaining.is_zero() {
+            drop(frame);
+            thread::sleep(remaining);
+            continue;
+        }
+        if !is_active() {
+            drop(frame);
+            duplication = None;
+            previous_bgra.clear();
             continue;
         }
         let buffer = frame.buffer()?;
@@ -44,6 +82,12 @@ fn capture(mut stream: TcpStream, quality: u8, fps: u8) -> Result<()> {
         }
         let (width, height) = (buffer.width(), buffer.height());
         let source = buffer.as_nopadding_buffer(&mut packed);
+        if previous_bgra.as_slice() == source {
+            previous = Instant::now();
+            continue;
+        }
+        previous_bgra.clear();
+        previous_bgra.extend_from_slice(source);
         rgb.resize(width as usize * height as usize * 3, 0);
         for (src, dst) in source.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
             dst[0] = src[2];
@@ -58,9 +102,8 @@ fn capture(mut stream: TcpStream, quality: u8, fps: u8) -> Result<()> {
             ColorType::Rgb8.into(),
         )?;
         let id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
-        write_message(&mut stream, FRAME, &frame_payload(id, width, height, &jpeg))?;
+        write_message(stream, FRAME, &frame_payload(id, width, height, &jpeg))?;
         previous = Instant::now();
-        heartbeat = Instant::now();
     }
 }
 
@@ -74,13 +117,54 @@ fn connect_and_capture() -> Result<()> {
     if read_message(&mut stream, 32)?.0 != AUTH_SUCCESS {
         bail!("agent authentication rejected")
     }
-    capture(stream, config.jpeg_quality, config.max_fps)
+    stream.set_read_timeout(None)?;
+    let control: Control = Arc::new((
+        Mutex::new(ControlState {
+            active: false,
+            connected: true,
+        }),
+        Condvar::new(),
+    ));
+    let reader_control = control.clone();
+    let mut reader = stream.try_clone()?;
+    let reader_thread = thread::spawn(move || {
+        loop {
+            match read_message(&mut reader, 32) {
+                Ok((AGENT_START, _)) => {
+                    let mut state = reader_control.0.lock().unwrap();
+                    state.active = true;
+                    reader_control.1.notify_all();
+                }
+                Ok((AGENT_STOP, _)) => {
+                    let mut state = reader_control.0.lock().unwrap();
+                    state.active = false;
+                    reader_control.1.notify_all();
+                }
+                _ => break,
+            }
+        }
+        let mut state = reader_control.0.lock().unwrap();
+        state.connected = false;
+        state.active = false;
+        reader_control.1.notify_all();
+    });
+    let result = capture(&mut stream, config.jpeg_quality, config.max_fps, &control);
+    let _ = stream.shutdown(Shutdown::Both);
+    let _ = reader_thread.join();
+    result
 }
 
 fn main() {
     loop {
         if let Err(error) = connect_and_capture() {
-            let path = config_path().with_file_name("agent.log");
+            let path = std::env::var("LOCALAPPDATA")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::env::temp_dir())
+                .join("RVHost")
+                .join("agent.log");
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let _ = std::fs::write(path, format!("{error:#}\n"));
         }
         thread::sleep(Duration::from_secs(2));

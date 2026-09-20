@@ -16,9 +16,9 @@ windows-service = "0.8"
 windows-capture = "2.0.1"
 
 [[bin]]
-name = "RemoteViewerHost"
+name = "RVHost"
 path = "src/bin/service.rs"
 
 [[bin]]
-name = "RemoteViewerCapture"
+name = "RVCapture"
 path = "src/bin/agent.rs"

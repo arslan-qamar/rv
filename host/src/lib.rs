@@ -13,6 +13,9 @@ pub const PING: u8 = 6;
 pub const PONG: u8 = 7;
 pub const BUSY: u8 = 8;
 pub const DISCONNECT: u8 = 9;
+// Local IPC only. These values are never accepted from or sent to LAN viewers.
+pub const AGENT_START: u8 = 100;
+pub const AGENT_STOP: u8 = 101;
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -27,7 +30,7 @@ pub struct Config {
 
 pub fn config_path() -> PathBuf {
     PathBuf::from(std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".into()))
-        .join("RemoteViewerHost")
+        .join("RVHost")
         .join("config.json")
 }
 

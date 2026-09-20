@@ -26,8 +26,24 @@ use windows_service::{
     service_dispatcher,
 };
 
-const NAME: &str = "RemoteViewerHost";
+const NAME: &str = "RVHost";
 type Latest = Arc<(Mutex<Option<Vec<u8>>>, Condvar)>;
+#[derive(Clone, Copy)]
+struct ViewerState {
+    active: bool,
+    generation: u64,
+}
+type ViewerActivity = Arc<(Mutex<ViewerState>, Condvar)>;
+
+fn set_viewer_active(activity: &ViewerActivity, active: bool) {
+    let (lock, changed) = &**activity;
+    let mut state = lock.lock().unwrap();
+    if state.active != active {
+        state.active = active;
+        state.generation = state.generation.wrapping_add(1);
+        changed.notify_all();
+    }
+}
 
 fn log_error(message: &str) {
     let path = config_path().with_file_name("host.log");
@@ -119,6 +135,13 @@ fn run_service() -> Result<()> {
     let config = Arc::new(load_config()?);
     let password_hash = Arc::new(fs::read_to_string(password_hash_path())?);
     let latest: Latest = Arc::new((Mutex::new(None), Condvar::new()));
+    let viewer_activity: ViewerActivity = Arc::new((
+        Mutex::new(ViewerState {
+            active: false,
+            generation: 0,
+        }),
+        Condvar::new(),
+    ));
     let viewer_busy = Arc::new(AtomicBool::new(false));
     let ipc = TcpListener::bind(("127.0.0.1", config.ipc_port))?;
     let lan = TcpListener::bind(("0.0.0.0", config.port))?;
@@ -128,10 +151,15 @@ fn run_service() -> Result<()> {
     while !stopped.load(Ordering::SeqCst) {
         match ipc.accept() {
             Ok((stream, _)) => {
+                if let Err(error) = stream.set_nonblocking(false) {
+                    log_error(&format!("agent socket mode: {error}"));
+                    continue;
+                }
                 let c = config.clone();
                 let l = latest.clone();
+                let activity = viewer_activity.clone();
                 thread::spawn(move || {
-                    if let Err(e) = agent_session(stream, &c, &l) {
+                    if let Err(e) = agent_session(stream, &c, &l, &activity) {
                         log_error(&format!("agent: {e:#}"));
                     }
                     let (lock, changed) = &*l;
@@ -144,6 +172,10 @@ fn run_service() -> Result<()> {
         }
         match lan.accept() {
             Ok((mut stream, _)) => {
+                if let Err(error) = stream.set_nonblocking(false) {
+                    log_error(&format!("viewer socket mode: {error}"));
+                    continue;
+                }
                 let _ = stream.set_nodelay(true);
                 if viewer_busy
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -155,10 +187,15 @@ fn run_service() -> Result<()> {
                     let hash = password_hash.clone();
                     let l = latest.clone();
                     let busy = viewer_busy.clone();
+                    let activity = viewer_activity.clone();
                     thread::spawn(move || {
-                        if let Err(e) = viewer_session(stream, &c, &hash, &l) {
+                        if let Err(e) = viewer_session(stream, &c, &hash, &l, &activity) {
                             log_error(&format!("viewer: {e:#}"));
                         }
+                        set_viewer_active(&activity, false);
+                        let (lock, changed) = &*l;
+                        *lock.lock().unwrap() = None;
+                        changed.notify_all();
                         busy.store(false, Ordering::SeqCst);
                     });
                 }
@@ -172,37 +209,78 @@ fn run_service() -> Result<()> {
     Ok(())
 }
 
-fn agent_session(mut stream: TcpStream, config: &Config, latest: &Latest) -> Result<()> {
+fn agent_session(
+    mut stream: TcpStream,
+    config: &Config,
+    latest: &Latest,
+    activity: &ViewerActivity,
+) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (kind, token) = read_message(&mut stream, 128)?;
     if kind != AUTH || token != config.agent_token.as_bytes() {
         bail!("bad agent token")
     }
     write_message(&mut stream, AUTH_SUCCESS, &[])?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    loop {
-        let (kind, payload) = read_message(&mut stream, MAX_PAYLOAD)?;
-        if kind == PING {
-            continue;
+    // DXGI can pause for more than a few seconds while a VM display is being
+    // resized, suspended, locked, or reconfigured. Keep authenticated local IPC
+    // blocking and let EOF/socket errors detect an agent that actually exited.
+    stream.set_read_timeout(None)?;
+    let alive = Arc::new(AtomicBool::new(true));
+    let writer_alive = alive.clone();
+    let writer_activity = activity.clone();
+    let mut control_stream = stream.try_clone()?;
+    let control_writer = thread::spawn(move || -> Result<()> {
+        let mut seen_generation = u64::MAX;
+        loop {
+            let (lock, changed) = &*writer_activity;
+            let state = lock.lock().unwrap();
+            let state = changed
+                .wait_while(state, |state| {
+                    writer_alive.load(Ordering::SeqCst) && state.generation == seen_generation
+                })
+                .unwrap();
+            if !writer_alive.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let kind = if state.active {
+                AGENT_START
+            } else {
+                AGENT_STOP
+            };
+            seen_generation = state.generation;
+            drop(state);
+            write_message(&mut control_stream, kind, &[])?;
         }
-        if kind != FRAME || payload.len() < 20 {
-            bail!("bad agent frame")
+    });
+    let result = (|| -> Result<()> {
+        loop {
+            let (kind, payload) = read_message(&mut stream, MAX_PAYLOAD)?;
+            if kind == PING {
+                continue;
+            }
+            if kind != FRAME || payload.len() < 20 {
+                bail!("bad agent frame")
+            }
+            let width = u32::from_be_bytes(payload[8..12].try_into()?);
+            let height = u32::from_be_bytes(payload[12..16].try_into()?);
+            let jpeg_len = u32::from_be_bytes(payload[16..20].try_into()?) as usize;
+            if width == 0
+                || height == 0
+                || width > 16384
+                || height > 16384
+                || jpeg_len != payload.len() - 20
+            {
+                bail!("invalid frame dimensions")
+            }
+            let (lock, changed) = &**latest;
+            *lock.lock().unwrap() = Some(payload);
+            changed.notify_all();
         }
-        let width = u32::from_be_bytes(payload[8..12].try_into()?);
-        let height = u32::from_be_bytes(payload[12..16].try_into()?);
-        let jpeg_len = u32::from_be_bytes(payload[16..20].try_into()?) as usize;
-        if width == 0
-            || height == 0
-            || width > 16384
-            || height > 16384
-            || jpeg_len != payload.len() - 20
-        {
-            bail!("invalid frame dimensions")
-        }
-        let (lock, changed) = &**latest;
-        *lock.lock().unwrap() = Some(payload);
-        changed.notify_all();
-    }
+    })();
+    alive.store(false, Ordering::SeqCst);
+    activity.1.notify_all();
+    let _ = control_writer.join();
+    result
 }
 
 fn viewer_session(
@@ -210,6 +288,7 @@ fn viewer_session(
     _config: &Config,
     password_hash: &str,
     latest: &Latest,
+    activity: &ViewerActivity,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (kind, supplied) = read_message(&mut stream, 256)?;
@@ -224,6 +303,11 @@ fn viewer_session(
         return Ok(());
     }
     write_message(&mut stream, AUTH_SUCCESS, &[])?;
+    set_viewer_active(activity, true);
+    // Authentication has completed. Keep the read side blocking while the writer
+    // waits for desktop frames; an inherited authentication timeout would
+    // otherwise disconnect an idle viewer after ten seconds.
+    stream.set_read_timeout(None)?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     let disconnected = Arc::new(AtomicBool::new(false));
     let reader_flag = disconnected.clone();
