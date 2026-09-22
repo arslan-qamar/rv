@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import 'discovery.dart';
 import 'protocol.dart';
 
 void main() {
@@ -31,12 +32,15 @@ class _ViewerPageState extends State<ViewerPage> {
   final port = TextEditingController(text: '5901');
   final password = TextEditingController();
   final connection = RemoteConnection();
+  final discovery = HostDiscovery();
   final transform = TransformationController();
 
   @override
   void initState() {
     super.initState();
     connection.addListener(_refresh);
+    discovery.addListener(_refresh);
+    discovery.scan();
   }
 
   void _refresh() {
@@ -46,7 +50,9 @@ class _ViewerPageState extends State<ViewerPage> {
   @override
   void dispose() {
     connection.removeListener(_refresh);
+    discovery.removeListener(_refresh);
     connection.dispose();
+    discovery.dispose();
     host.dispose();
     port.dispose();
     password.dispose();
@@ -68,6 +74,17 @@ class _ViewerPageState extends State<ViewerPage> {
     transform.value = Matrix4.identity();
     await connection.connect(host.text.trim(), number, password.text);
     password.clear();
+  }
+
+  void _selectHost(DiscoveredHost selected) {
+    host.text = selected.address;
+    port.text = selected.port.toString();
+  }
+
+  String _endpoint(DiscoveredHost found) {
+    final address =
+        found.address.contains(':') ? '[${found.address}]' : found.address;
+    return '$address:${found.port}';
   }
 
   @override
@@ -150,49 +167,91 @@ class _ViewerPageState extends State<ViewerPage> {
                   ),
               ],
             )
-          : Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 420),
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      TextField(
-                        controller: host,
-                        decoration: const InputDecoration(
-                          labelText: 'Host',
-                          hintText: '192.168.1.25',
+          : SingleChildScrollView(
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 420),
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Row(
+                          children: [
+                            const Expanded(
+                              child: Text(
+                                'Hosts on your network',
+                                style: TextStyle(fontWeight: FontWeight.w600),
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: 'Scan again',
+                              onPressed:
+                                  discovery.scanning ? null : discovery.scan,
+                              icon: const Icon(Icons.refresh),
+                            ),
+                          ],
                         ),
-                      ),
-                      TextField(
-                        controller: port,
-                        decoration: const InputDecoration(labelText: 'Port'),
-                        keyboardType: TextInputType.number,
-                      ),
-                      TextField(
-                        controller: password,
-                        decoration: const InputDecoration(
-                          labelText: 'Password',
-                        ),
-                        obscureText: true,
-                        onSubmitted: (_) => _connect(),
-                      ),
-                      const SizedBox(height: 20),
-                      FilledButton(
-                        onPressed: _connect,
-                        child: const Text('Connect'),
-                      ),
-                      const SizedBox(height: 12),
-                      Text(connection.status),
-                      if (Platform.isAndroid)
-                        const Padding(
-                          padding: EdgeInsets.only(top: 8),
-                          child: Text(
-                            'Pinch to zoom and drag to pan. Gestures stay on this device.',
+                        if (discovery.scanning)
+                          const LinearProgressIndicator()
+                        else if (discovery.hosts.isEmpty)
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 8),
+                              child: Text(
+                                discovery.error ?? 'No RVHost devices found',
+                                style: Theme.of(context).textTheme.bodySmall,
+                              ),
+                            ),
+                          )
+                        else
+                          ...discovery.hosts.map(
+                            (found) => ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: const Icon(Icons.computer),
+                              title: Text(found.name),
+                              subtitle: Text(_endpoint(found)),
+                              onTap: () => _selectHost(found),
+                            ),
+                          ),
+                        const Divider(height: 32),
+                        TextField(
+                          controller: host,
+                          decoration: const InputDecoration(
+                            labelText: 'Host',
+                            hintText: '192.168.1.25',
                           ),
                         ),
-                    ],
+                        TextField(
+                          controller: port,
+                          decoration: const InputDecoration(labelText: 'Port'),
+                          keyboardType: TextInputType.number,
+                        ),
+                        TextField(
+                          controller: password,
+                          decoration: const InputDecoration(
+                            labelText: 'Password',
+                          ),
+                          obscureText: true,
+                          onSubmitted: (_) => _connect(),
+                        ),
+                        const SizedBox(height: 20),
+                        FilledButton(
+                          onPressed: _connect,
+                          child: const Text('Connect'),
+                        ),
+                        const SizedBox(height: 12),
+                        Text(connection.status),
+                        if (Platform.isAndroid)
+                          const Padding(
+                            padding: EdgeInsets.only(top: 8),
+                            child: Text(
+                              'Pinch to zoom and drag to pan. Gestures stay on this device.',
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -223,7 +282,8 @@ class _ScreenshotPageState extends State<ScreenshotPage> {
               actions: [
                 IconButton(
                   tooltip: 'Refresh',
-                  onPressed: connection.connected ? connection.loadSnapshots : null,
+                  onPressed:
+                      connection.connected ? connection.loadSnapshots : null,
                   icon: const Icon(Icons.refresh),
                 ),
               ],
@@ -242,7 +302,8 @@ class _ScreenshotPageState extends State<ScreenshotPage> {
                                 ? Center(
                                     child: Text(
                                       connection.snapshotStatus ?? 'Loading…',
-                                      style: const TextStyle(color: Colors.white),
+                                      style:
+                                          const TextStyle(color: Colors.white),
                                     ),
                                   )
                                 : InteractiveViewer(
@@ -266,7 +327,8 @@ class _ScreenshotPageState extends State<ScreenshotPage> {
                           itemCount: connection.snapshotIds.length,
                           itemBuilder: (context, index) {
                             final id = connection.snapshotIds[index];
-                            final time = DateTime.fromMicrosecondsSinceEpoch(id).toLocal();
+                            final time = DateTime.fromMicrosecondsSinceEpoch(id)
+                                .toLocal();
                             return ListTile(
                               selected: id == selected,
                               leading: const Icon(Icons.image_outlined),

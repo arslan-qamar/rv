@@ -9,6 +9,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  multicast_dns: 0.3.3
 
 flutter:
   uses-material-design: true

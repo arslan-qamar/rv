@@ -3,6 +3,7 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rand::{rngs::OsRng, RngCore};
 use remote_viewer_host::snapshots;
 use remote_viewer_host::*;
@@ -28,6 +29,7 @@ use windows_service::{
 };
 
 const NAME: &str = "RVHost";
+const DISCOVERY_TYPE: &str = "_rvhost._tcp.local.";
 type Latest = Arc<(Mutex<Option<Vec<u8>>>, Condvar)>;
 #[derive(Clone, Copy)]
 struct ViewerState {
@@ -51,6 +53,45 @@ fn log_error(message: &str) {
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{message}");
     }
+}
+
+fn dns_hostname() -> String {
+    let computer_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| NAME.into());
+    let mut label = String::with_capacity(computer_name.len());
+    for character in computer_name.chars() {
+        let character = character.to_ascii_lowercase();
+        if character.is_ascii_alphanumeric() {
+            label.push(character);
+        } else if !label.ends_with('-') {
+            label.push('-');
+        }
+        if label.len() == 63 {
+            break;
+        }
+    }
+    let label = label.trim_matches('-');
+    format!("{}.local.", if label.is_empty() { "rvhost" } else { label })
+}
+
+fn advertise(config: &Config) -> Result<(ServiceDaemon, String)> {
+    let daemon = ServiceDaemon::new()?;
+    let properties = [("protocol", VERSION.to_string())];
+    let mut name_end = config.device_name.len().min(63);
+    while !config.device_name.is_char_boundary(name_end) {
+        name_end -= 1;
+    }
+    let info = ServiceInfo::new(
+        DISCOVERY_TYPE,
+        &config.device_name[..name_end],
+        &dns_hostname(),
+        "",
+        config.port,
+        &properties[..],
+    )?
+    .enable_addr_auto();
+    let fullname = info.get_fullname().to_owned();
+    daemon.register(info)?;
+    Ok((daemon, fullname))
 }
 
 fn init(path: &str) -> Result<()> {
@@ -174,6 +215,13 @@ fn run_service() -> Result<()> {
     let lan = TcpListener::bind(("0.0.0.0", config.port))?;
     ipc.set_nonblocking(true)?;
     lan.set_nonblocking(true)?;
+    let discovery = match advertise(&config) {
+        Ok(discovery) => Some(discovery),
+        Err(error) => {
+            log_error(&format!("discovery unavailable: {error:#}"));
+            None
+        }
+    };
     handler.set_service_status(status(ServiceState::Running, ServiceControlAccept::STOP))?;
     while !stopped.load(Ordering::SeqCst) {
         match ipc.accept() {
@@ -233,6 +281,14 @@ fn run_service() -> Result<()> {
             Err(e) => log_error(&format!("LAN accept: {e}")),
         }
         thread::sleep(Duration::from_millis(10));
+    }
+    if let Some((daemon, fullname)) = discovery {
+        if let Err(error) = daemon.unregister(&fullname) {
+            log_error(&format!("discovery unregister: {error}"));
+        }
+        if let Err(error) = daemon.shutdown() {
+            log_error(&format!("discovery shutdown: {error}"));
+        }
     }
     handler.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty()))?;
     Ok(())

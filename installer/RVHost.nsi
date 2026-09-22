@@ -90,6 +90,7 @@ Section "Install"
   nsExec::ExecToLog 'taskkill.exe /F /IM RVHost.exe'
   nsExec::ExecToLog 'sc.exe delete RVHost'
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost"'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost Discovery"'
   Sleep 750
   SetOutPath "$INSTDIR"
   File "..\host\target\${BUILDTARGET}\release\RVHost.exe"
@@ -152,6 +153,12 @@ Section "Install"
     MessageBox MB_ICONSTOP "Could not add the LAN firewall rule."
     Abort
   ${EndIf}
+  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="RVHost Discovery" dir=in action=allow protocol=UDP localport=5353 program="$INSTDIR\RVHost.exe" profile=any remoteip=localsubnet enable=yes'
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_ICONSTOP "Could not add the discovery firewall rule."
+    Abort
+  ${EndIf}
   nsExec::ExecToLog 'sc.exe start RVHost'
   Pop $0
   ${If} $0 != 0
@@ -190,6 +197,7 @@ Section "Uninstall"
   nsExec::ExecToLog 'taskkill.exe /F /IM RVHost.exe'
   nsExec::ExecToLog 'sc.exe delete RVHost'
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost"'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost Discovery"'
   Sleep 500
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RVHost"
   Delete "$INSTDIR\RVHost.exe"
