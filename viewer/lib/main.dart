@@ -80,6 +80,16 @@ class _ViewerPageState extends State<ViewerPage> {
         actions: connection.connected
             ? [
                 IconButton(
+                  tooltip: 'Saved screenshots',
+                  onPressed: () {
+                    connection.loadSnapshots();
+                    Navigator.of(context).push(MaterialPageRoute<void>(
+                      builder: (_) => ScreenshotPage(connection: connection),
+                    ));
+                  },
+                  icon: const Icon(Icons.photo_library_outlined),
+                ),
+                IconButton(
                   tooltip: 'Fit to screen',
                   onPressed: () => transform.value = Matrix4.identity(),
                   icon: const Icon(Icons.fit_screen),
@@ -189,4 +199,89 @@ class _ViewerPageState extends State<ViewerPage> {
             ),
     );
   }
+}
+
+class ScreenshotPage extends StatefulWidget {
+  const ScreenshotPage({super.key, required this.connection});
+  final RemoteConnection connection;
+
+  @override
+  State<ScreenshotPage> createState() => _ScreenshotPageState();
+}
+
+class _ScreenshotPageState extends State<ScreenshotPage> {
+  int? selected;
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+        animation: widget.connection,
+        builder: (context, _) {
+          final connection = widget.connection;
+          return Scaffold(
+            appBar: AppBar(
+              title: const Text('Saved screenshots'),
+              actions: [
+                IconButton(
+                  tooltip: 'Refresh',
+                  onPressed: connection.connected ? connection.loadSnapshots : null,
+                  icon: const Icon(Icons.refresh),
+                ),
+              ],
+            ),
+            body: !connection.connected
+                ? const Center(child: Text('Disconnected'))
+                : Column(
+                    children: [
+                      if (selected != null)
+                        Expanded(
+                          flex: 3,
+                          child: Container(
+                            width: double.infinity,
+                            color: Colors.black,
+                            child: connection.snapshotJpeg == null
+                                ? Center(
+                                    child: Text(
+                                      connection.snapshotStatus ?? 'Loading…',
+                                      style: const TextStyle(color: Colors.white),
+                                    ),
+                                  )
+                                : InteractiveViewer(
+                                    minScale: 1,
+                                    maxScale: 6,
+                                    child: Image.memory(
+                                      connection.snapshotJpeg!,
+                                      fit: BoxFit.contain,
+                                    ),
+                                  ),
+                          ),
+                        ),
+                      if (connection.snapshotStatus != null && selected == null)
+                        Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Text(connection.snapshotStatus!),
+                        ),
+                      Expanded(
+                        flex: 2,
+                        child: ListView.builder(
+                          itemCount: connection.snapshotIds.length,
+                          itemBuilder: (context, index) {
+                            final id = connection.snapshotIds[index];
+                            final time = DateTime.fromMicrosecondsSinceEpoch(id).toLocal();
+                            return ListTile(
+                              selected: id == selected,
+                              leading: const Icon(Icons.image_outlined),
+                              title: Text(time.toString().split('.').first),
+                              onTap: () {
+                                setState(() => selected = id);
+                                connection.loadSnapshot(id);
+                              },
+                            );
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+          );
+        },
+      );
 }

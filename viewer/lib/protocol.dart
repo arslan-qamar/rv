@@ -6,12 +6,17 @@ import 'package:flutter/foundation.dart';
 
 const int auth = 1, authSuccess = 2, authFailure = 3, screenInfo = 4;
 const int frame = 5, ping = 6, pong = 7, busy = 8, disconnectMessage = 9;
+const int snapshotList = 10, snapshotListReply = 11, snapshotGet = 12;
+const int snapshotFrame = 13, snapshotError = 14;
 const int maxPayload = 16 * 1024 * 1024;
 
 class RemoteConnection extends ChangeNotifier {
   Socket? _socket;
   Uint8List _pending = Uint8List(0);
   Uint8List? jpeg;
+  Uint8List? snapshotJpeg;
+  List<int> snapshotIds = [];
+  String? snapshotStatus;
   int width = 0, height = 0, fps = 0;
   int _frames = 0;
   DateTime _fpsSince = DateTime.now();
@@ -53,6 +58,22 @@ class RemoteConnection extends ChangeNotifier {
       ..setUint8(1, type)
       ..setUint32(2, payload.length);
     _socket?.add([...header.buffer.asUint8List(), ...payload]);
+  }
+
+  void loadSnapshots() {
+    if (!connected) return;
+    snapshotStatus = 'Loading screenshots…';
+    notifyListeners();
+    _send(snapshotList, const []);
+  }
+
+  void loadSnapshot(int id) {
+    if (!connected) return;
+    snapshotJpeg = null;
+    snapshotStatus = 'Loading screenshot…';
+    notifyListeners();
+    final bytes = ByteData(8)..setUint64(0, id);
+    _send(snapshotGet, bytes.buffer.asUint8List());
   }
 
   void _receive(List<int> chunk) {
@@ -121,6 +142,37 @@ class RemoteConnection extends ChangeNotifier {
           newest = Uint8List.fromList(payload.sublist(20));
           _frames++;
           break;
+        case snapshotListReply:
+          if (length % 8 != 0) {
+            _fail('Invalid screenshot list');
+            return;
+          }
+          final ids = ByteData.sublistView(payload);
+          snapshotIds = [
+            for (var i = 0; i < length; i += 8) ids.getUint64(i),
+          ];
+          snapshotStatus = snapshotIds.isEmpty ? 'No screenshots yet' : null;
+          changed = true;
+          break;
+        case snapshotFrame:
+          if (length < 20) {
+            snapshotStatus = 'Invalid screenshot';
+          } else {
+            final info = ByteData.sublistView(payload);
+            final jpegLength = info.getUint32(16);
+            if (jpegLength != length - 20) {
+              snapshotStatus = 'Invalid screenshot';
+            } else {
+              snapshotJpeg = Uint8List.fromList(payload.sublist(20));
+              snapshotStatus = null;
+            }
+          }
+          changed = true;
+          break;
+        case snapshotError:
+          snapshotStatus = 'Screenshot unavailable';
+          changed = true;
+          break;
         case ping:
           _send(pong, const []);
           break;
@@ -167,6 +219,9 @@ class RemoteConnection extends ChangeNotifier {
     _socket = null;
     _pending = Uint8List(0);
     jpeg = null;
+    snapshotJpeg = null;
+    snapshotIds = [];
+    snapshotStatus = null;
     connected = false;
     fps = 0;
     if (!_disposed) notifyListeners();

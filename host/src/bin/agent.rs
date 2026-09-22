@@ -16,6 +16,7 @@ use windows_capture::{
 
 struct ControlState {
     active: bool,
+    snapshot: bool,
     connected: bool,
 }
 type Control = Arc<(Mutex<ControlState>, Condvar)>;
@@ -28,11 +29,21 @@ fn capture(stream: &mut TcpStream, quality: u8, fps: u8, control: &Control) -> R
     let mut previous_bgra = Vec::new();
     let mut rgb = Vec::new();
     loop {
+        let idle = {
+            let state = control.0.lock().unwrap();
+            !state.active && !state.snapshot
+        };
+        if idle {
+            duplication = None;
+            previous_bgra.clear();
+        }
         {
             let (lock, changed) = &**control;
             let state = lock.lock().unwrap();
             let state = changed
-                .wait_while(state, |state| state.connected && !state.active)
+                .wait_while(state, |state| {
+                    state.connected && !state.active && !state.snapshot
+                })
                 .unwrap();
             if !state.connected {
                 bail!("service disconnected")
@@ -47,7 +58,10 @@ fn capture(stream: &mut TcpStream, quality: u8, fps: u8, control: &Control) -> R
             previous_bgra.clear();
             previous = Instant::now() - interval;
         }
-        let is_active = || control.0.lock().unwrap().active;
+        let is_active = || {
+            let state = control.0.lock().unwrap();
+            state.active || state.snapshot
+        };
         let mut frame = match duplication.as_mut().unwrap().acquire_next_frame(33) {
             Ok(frame) => frame,
             Err(CaptureError::Timeout) => continue,
@@ -82,7 +96,7 @@ fn capture(stream: &mut TcpStream, quality: u8, fps: u8, control: &Control) -> R
         }
         let (width, height) = (buffer.width(), buffer.height());
         let source = buffer.as_nopadding_buffer(&mut packed);
-        if previous_bgra.as_slice() == source {
+        if previous_bgra.as_slice() == source && !control.0.lock().unwrap().snapshot {
             previous = Instant::now();
             continue;
         }
@@ -103,6 +117,7 @@ fn capture(stream: &mut TcpStream, quality: u8, fps: u8, control: &Control) -> R
         )?;
         let id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
         write_message(stream, FRAME, &frame_payload(id, width, height, &jpeg))?;
+        control.0.lock().unwrap().snapshot = false;
         previous = Instant::now();
     }
 }
@@ -121,6 +136,7 @@ fn connect_and_capture() -> Result<()> {
     let control: Control = Arc::new((
         Mutex::new(ControlState {
             active: false,
+            snapshot: false,
             connected: true,
         }),
         Condvar::new(),
@@ -138,6 +154,11 @@ fn connect_and_capture() -> Result<()> {
                 Ok((AGENT_STOP, _)) => {
                     let mut state = reader_control.0.lock().unwrap();
                     state.active = false;
+                    reader_control.1.notify_all();
+                }
+                Ok((AGENT_SNAPSHOT, _)) => {
+                    let mut state = reader_control.0.lock().unwrap();
+                    state.snapshot = true;
                     reader_control.1.notify_all();
                 }
                 _ => break,

@@ -4,6 +4,7 @@ use argon2::{
     Argon2,
 };
 use rand::{rngs::OsRng, RngCore};
+use remote_viewer_host::snapshots;
 use remote_viewer_host::*;
 use std::{
     fs,
@@ -79,6 +80,28 @@ fn init(path: &str) -> Result<()> {
         .hash_password(password.as_bytes(), &salt)
         .map_err(|error| anyhow::anyhow!("password hash: {error}"))?
         .to_string();
+    let old_password_matches = fs::read_to_string(password_hash_path())
+        .ok()
+        .is_some_and(|old| {
+            PasswordHash::new(&old).ok().is_some_and(|stored| {
+                Argon2::default()
+                    .verify_password(password.as_bytes(), &stored)
+                    .is_ok()
+            })
+        });
+    let key_path = config_path().with_file_name("screenshots.key");
+    if !old_password_matches || !key_path.exists() {
+        // Changing the login password starts a fresh archive: old files cannot
+        // be decrypted with the new password-derived key.
+        if snapshots::directory().exists() {
+            fs::remove_dir_all(snapshots::directory())?;
+        }
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let key = snapshots::derive_key(password.as_bytes(), &salt)?;
+        fs::create_dir_all(config_path().parent().unwrap())?;
+        fs::write(&key_path, snapshots::protect_key(&key)?)?;
+    }
     let mut token = [0u8; 32];
     OsRng.fill_bytes(&mut token);
     let agent_token = token.iter().map(|b| format!("{b:02x}")).collect();
@@ -94,6 +117,7 @@ fn init(path: &str) -> Result<()> {
     fs::create_dir_all(target.parent().unwrap())?;
     fs::write(&target, serde_json::to_vec_pretty(&config)?)?;
     fs::write(password_hash_path(), hash)?;
+    fs::create_dir_all(snapshots::directory())?;
     // The installer grants ordinary users read-only access so an interactive agent can read its token.
     Ok(())
 }
@@ -134,6 +158,9 @@ fn run_service() -> Result<()> {
     ))?;
     let config = Arc::new(load_config()?);
     let password_hash = Arc::new(fs::read_to_string(password_hash_path())?);
+    let snapshot_key = Arc::new(snapshots::unprotect_key(&fs::read(
+        config_path().with_file_name("screenshots.key"),
+    )?)?);
     let latest: Latest = Arc::new((Mutex::new(None), Condvar::new()));
     let viewer_activity: ViewerActivity = Arc::new((
         Mutex::new(ViewerState {
@@ -158,8 +185,9 @@ fn run_service() -> Result<()> {
                 let c = config.clone();
                 let l = latest.clone();
                 let activity = viewer_activity.clone();
+                let key = snapshot_key.clone();
                 thread::spawn(move || {
-                    if let Err(e) = agent_session(stream, &c, &l, &activity) {
+                    if let Err(e) = agent_session(stream, &c, &l, &activity, &key) {
                         log_error(&format!("agent: {e:#}"));
                     }
                     let (lock, changed) = &*l;
@@ -188,8 +216,9 @@ fn run_service() -> Result<()> {
                     let l = latest.clone();
                     let busy = viewer_busy.clone();
                     let activity = viewer_activity.clone();
+                    let key = snapshot_key.clone();
                     thread::spawn(move || {
-                        if let Err(e) = viewer_session(stream, &c, &hash, &l, &activity) {
+                        if let Err(e) = viewer_session(stream, &c, &hash, &l, &activity, &key) {
                             log_error(&format!("viewer: {e:#}"));
                         }
                         set_viewer_active(&activity, false);
@@ -214,6 +243,7 @@ fn agent_session(
     config: &Config,
     latest: &Latest,
     activity: &ViewerActivity,
+    key: &[u8; 32],
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (kind, token) = read_message(&mut stream, 128)?;
@@ -234,15 +264,17 @@ fn agent_session(
         loop {
             let (lock, changed) = &*writer_activity;
             let state = lock.lock().unwrap();
-            let state = changed
-                .wait_while(state, |state| {
+            let (state, timeout) = changed
+                .wait_timeout_while(state, Duration::from_secs(60), |state| {
                     writer_alive.load(Ordering::SeqCst) && state.generation == seen_generation
                 })
                 .unwrap();
             if !writer_alive.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            let kind = if state.active {
+            let kind = if timeout.timed_out() && !state.active {
+                AGENT_SNAPSHOT
+            } else if state.active {
                 AGENT_START
             } else {
                 AGENT_STOP
@@ -253,6 +285,7 @@ fn agent_session(
         }
     });
     let result = (|| -> Result<()> {
+        let mut last_snapshot = snapshots::list()?.first().copied().unwrap_or(0);
         loop {
             let (kind, payload) = read_message(&mut stream, MAX_PAYLOAD)?;
             if kind == PING {
@@ -273,8 +306,17 @@ fn agent_session(
                 bail!("invalid frame dimensions")
             }
             let (lock, changed) = &**latest;
-            *lock.lock().unwrap() = Some(payload);
-            changed.notify_all();
+            let id = u64::from_be_bytes(payload[..8].try_into()?);
+            if id.saturating_sub(last_snapshot) >= 60_000_000 {
+                match snapshots::store(id, &payload, key) {
+                    Ok(()) => last_snapshot = id,
+                    Err(e) => log_error(&format!("snapshot store: {e:#}")),
+                }
+            }
+            if activity.0.lock().unwrap().active {
+                *lock.lock().unwrap() = Some(payload);
+                changed.notify_all();
+            }
         }
     })();
     alive.store(false, Ordering::SeqCst);
@@ -289,6 +331,7 @@ fn viewer_session(
     password_hash: &str,
     latest: &Latest,
     activity: &ViewerActivity,
+    key: &[u8; 32],
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (kind, supplied) = read_message(&mut stream, 256)?;
@@ -309,13 +352,45 @@ fn viewer_session(
     // otherwise disconnect an idle viewer after ten seconds.
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let disconnected = Arc::new(AtomicBool::new(false));
     let reader_flag = disconnected.clone();
     let mut reader = stream.try_clone()?;
+    let reader_writer = writer.clone();
+    let reader_key = *key;
     thread::spawn(move || {
         loop {
             match read_message(&mut reader, 32) {
                 Ok((PONG, _)) => (),
+                Ok((SNAPSHOT_LIST, payload)) if payload.is_empty() => {
+                    let response = snapshots::list().map(|ids| {
+                        ids.into_iter()
+                            .flat_map(u64::to_be_bytes)
+                            .collect::<Vec<_>>()
+                    });
+                    let mut out = reader_writer.lock().unwrap();
+                    match response {
+                        Ok(data) => {
+                            let _ = write_message(&mut *out, SNAPSHOT_LIST_REPLY, &data);
+                        }
+                        Err(_) => {
+                            let _ = write_message(&mut *out, SNAPSHOT_ERROR, &[]);
+                        }
+                    }
+                }
+                Ok((SNAPSHOT_GET, payload)) if payload.len() == 8 => {
+                    let id = u64::from_be_bytes(payload.try_into().unwrap());
+                    let response = snapshots::get(id, &reader_key);
+                    let mut out = reader_writer.lock().unwrap();
+                    match response {
+                        Ok(data) => {
+                            let _ = write_message(&mut *out, SNAPSHOT_FRAME, &data);
+                        }
+                        Err(_) => {
+                            let _ = write_message(&mut *out, SNAPSHOT_ERROR, &[]);
+                        }
+                    }
+                }
                 Ok((DISCONNECT, _)) | Err(_) => break,
                 _ => break,
             }
@@ -341,12 +416,12 @@ fn viewer_session(
             guard.clone()
         };
         let Some(frame) = frame else {
-            write_message(&mut stream, PING, &[])?;
+            write_message(&mut *writer.lock().unwrap(), PING, &[])?;
             continue;
         };
         let id = u64::from_be_bytes(frame[..8].try_into()?);
         if id == last_id {
-            write_message(&mut stream, PING, &[])?;
+            write_message(&mut *writer.lock().unwrap(), PING, &[])?;
             continue;
         }
         let width = u32::from_be_bytes(frame[8..12].try_into()?);
@@ -355,10 +430,10 @@ fn viewer_session(
             let mut size = Vec::with_capacity(8);
             size.extend_from_slice(&width.to_be_bytes());
             size.extend_from_slice(&height.to_be_bytes());
-            write_message(&mut stream, SCREEN_INFO, &size)?;
+            write_message(&mut *writer.lock().unwrap(), SCREEN_INFO, &size)?;
             last_size = (width, height);
         }
-        write_message(&mut stream, FRAME, &frame)?;
+        write_message(&mut *writer.lock().unwrap(), FRAME, &frame)?;
         last_id = id;
     }
 }

@@ -7,6 +7,8 @@ viewer/android/.gradle/
 viewer/android/build/
 viewer/android/app/build/
 viewer/android/local.properties
+.tools/
 *.exe
 *.apk
 *.tar.gz
+installer/RVHost.nsi

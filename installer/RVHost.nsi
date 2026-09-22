@@ -119,6 +119,18 @@ Section "Install"
     MessageBox MB_ICONSTOP "Could not secure password hash."
     Abort
   ${EndIf}
+  nsExec::ExecToLog 'icacls "$APPDATA\RVHost\screenshots.key" /inheritance:r /remove:g "*S-1-5-32-545" /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F"'
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_ICONSTOP "Could not secure screenshot key."
+    Abort
+  ${EndIf}
+  nsExec::ExecToLog 'icacls "$APPDATA\RVHost\screenshots" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /remove:g "*S-1-5-32-545"'
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_ICONSTOP "Could not secure screenshot directory."
+    Abort
+  ${EndIf}
   nsExec::ExecToLog 'sc.exe create RVHost binPath= "$INSTDIR\RVHost.exe" start= auto DisplayName= "RVHost"'
   Pop $0
   ${If} $0 != 0

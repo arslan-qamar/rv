@@ -13,9 +13,15 @@ pub const PING: u8 = 6;
 pub const PONG: u8 = 7;
 pub const BUSY: u8 = 8;
 pub const DISCONNECT: u8 = 9;
+pub const SNAPSHOT_LIST: u8 = 10;
+pub const SNAPSHOT_LIST_REPLY: u8 = 11;
+pub const SNAPSHOT_GET: u8 = 12;
+pub const SNAPSHOT_FRAME: u8 = 13;
+pub const SNAPSHOT_ERROR: u8 = 14;
 // Local IPC only. These values are never accepted from or sent to LAN viewers.
 pub const AGENT_START: u8 = 100;
 pub const AGENT_STOP: u8 = 101;
+pub const AGENT_SNAPSHOT: u8 = 102;
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -41,6 +47,8 @@ pub fn load_config() -> Result<Config> {
 pub fn password_hash_path() -> PathBuf {
     config_path().with_file_name("password.hash")
 }
+
+pub mod snapshots;
 
 pub fn write_message<W: Write>(writer: &mut W, kind: u8, payload: &[u8]) -> Result<()> {
     if payload.len() > MAX_PAYLOAD {
