@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'discovery.dart';
 import 'protocol.dart';
@@ -240,7 +240,7 @@ class _ViewerPageState extends State<ViewerPage> {
                         ),
                         const SizedBox(height: 12),
                         DropdownButtonFormField<TransportMode>(
-                          value: transport,
+                          initialValue: transport,
                           decoration: const InputDecoration(
                             labelText: 'Connection transport',
                           ),

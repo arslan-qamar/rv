@@ -10,6 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
   flutter_webrtc: ^1.6.3
+  material_ui: ^1.11.1
   multicast_dns: 0.3.3
 
 flutter:
