@@ -34,6 +34,7 @@ class _ViewerPageState extends State<ViewerPage> {
   final connection = RemoteConnection();
   final discovery = HostDiscovery();
   final transform = TransformationController();
+  TransportMode transport = TransportMode.tcp;
 
   @override
   void initState() {
@@ -72,7 +73,8 @@ class _ViewerPageState extends State<ViewerPage> {
       return;
     }
     transform.value = Matrix4.identity();
-    await connection.connect(host.text.trim(), number, password.text);
+    await connection.connect(host.text.trim(), number, password.text,
+        transport: transport);
     password.clear();
   }
 
@@ -235,6 +237,27 @@ class _ViewerPageState extends State<ViewerPage> {
                           ),
                           obscureText: true,
                           onSubmitted: (_) => _connect(),
+                        ),
+                        const SizedBox(height: 12),
+                        DropdownButtonFormField<TransportMode>(
+                          value: transport,
+                          decoration: const InputDecoration(
+                            labelText: 'Connection transport',
+                          ),
+                          items: const [
+                            DropdownMenuItem(
+                              value: TransportMode.tcp,
+                              child: Text('TCP'),
+                            ),
+                            DropdownMenuItem(
+                              value: TransportMode.webRtc,
+                              child: Text('WebRTC (LAN)'),
+                            ),
+                          ],
+                          onChanged: (value) {
+                            if (value != null)
+                              setState(() => transport = value);
+                          },
                         ),
                         const SizedBox(height: 20),
                         FilledButton(

@@ -8,7 +8,10 @@ viewer/android/build/
 viewer/android/app/build/
 viewer/android/local.properties
 .tools/
+# Generated release bundles and Flutter packaging output
+/RemoteViewer-Linux-x64/
+/viewer/RemoteViewerLinux/bundle/
+/viewer/dist/
 *.exe
 *.apk
 *.tar.gz
-installer/RVHost.nsi

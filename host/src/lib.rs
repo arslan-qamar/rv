@@ -18,6 +18,11 @@ pub const SNAPSHOT_LIST_REPLY: u8 = 11;
 pub const SNAPSHOT_GET: u8 = 12;
 pub const SNAPSHOT_FRAME: u8 = 13;
 pub const SNAPSHOT_ERROR: u8 = 14;
+pub const AUTH_WEBRTC: u8 = 15;
+pub const WEBRTC_OFFER: u8 = 16;
+pub const WEBRTC_ANSWER: u8 = 17;
+pub const ICE_UDP_PORT_MIN: u16 = 50000;
+pub const ICE_UDP_PORT_MAX: u16 = 50100;
 // Local IPC only. These values are never accepted from or sent to LAN viewers.
 pub const AGENT_START: u8 = 100;
 pub const AGENT_STOP: u8 = 101;

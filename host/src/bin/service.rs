@@ -3,6 +3,7 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use bytes::Bytes;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rand::{rngs::OsRng, RngCore};
 use remote_viewer_host::snapshots;
@@ -16,7 +17,15 @@ use std::{
         Arc, Condvar, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use webrtc::{
+    api::{media_engine::MediaEngine, setting_engine::SettingEngine, APIBuilder},
+    data_channel::RTCDataChannel,
+    peer_connection::{
+        configuration::RTCConfiguration, peer_connection_state::RTCPeerConnectionState,
+        sdp::session_description::RTCSessionDescription,
+    },
 };
 use windows_service::{
     define_windows_service,
@@ -51,7 +60,15 @@ fn set_viewer_active(activity: &ViewerActivity, active: bool) {
 fn log_error(message: &str) {
     let path = config_path().with_file_name("host.log");
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{message}");
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let _ = writeln!(
+            file,
+            "{}.{:03} {message}",
+            timestamp.as_secs(),
+            timestamp.subsec_millis()
+        );
     }
 }
 
@@ -391,7 +408,8 @@ fn viewer_session(
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (kind, supplied) = read_message(&mut stream, 256)?;
-    let valid = kind == AUTH
+    let webrtc = kind == AUTH_WEBRTC;
+    let valid = (kind == AUTH || webrtc)
         && PasswordHash::new(password_hash).ok().is_some_and(|stored| {
             Argon2::default()
                 .verify_password(&supplied, &stored)
@@ -403,6 +421,9 @@ fn viewer_session(
     }
     write_message(&mut stream, AUTH_SUCCESS, &[])?;
     set_viewer_active(activity, true);
+    if webrtc {
+        return webrtc_viewer_session(stream, latest, key);
+    }
     // Authentication has completed. Keep the read side blocking while the writer
     // waits for desktop frames; an inherited authentication timeout would
     // otherwise disconnect an idle viewer after ten seconds.
@@ -447,7 +468,14 @@ fn viewer_session(
                         }
                     }
                 }
-                Ok((DISCONNECT, _)) | Err(_) => break,
+                Ok((DISCONNECT, _)) => {
+                    log_error("WebRTC viewer sent a disconnect message");
+                    break;
+                }
+                Err(error) => {
+                    log_error(&format!("WebRTC control TCP read ended: {error}"));
+                    break;
+                }
                 _ => break,
             }
         }
@@ -492,6 +520,217 @@ fn viewer_session(
         write_message(&mut *writer.lock().unwrap(), FRAME, &frame)?;
         last_id = id;
     }
+}
+
+fn webrtc_viewer_session(mut stream: TcpStream, latest: &Latest, key: &[u8; 32]) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let (kind, payload) = read_message(&mut stream, 1024 * 1024)?;
+    if kind != WEBRTC_OFFER {
+        bail!("expected WebRTC offer")
+    }
+    let offer: RTCSessionDescription = serde_json::from_slice(&payload)?;
+
+    let mut media_engine = MediaEngine::default();
+    media_engine.register_default_codecs()?;
+    let mut setting_engine = SettingEngine::default();
+    setting_engine.set_udp_network(webrtc::ice::udp_network::UDPNetwork::Ephemeral(
+        webrtc::ice::udp_network::EphemeralUDP::new(ICE_UDP_PORT_MIN, ICE_UDP_PORT_MAX)?,
+    ));
+    let api = APIBuilder::new()
+        .with_media_engine(media_engine)
+        .with_setting_engine(setting_engine)
+        .build();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let disconnected = Arc::new(AtomicBool::new(false));
+    let control_disconnected = disconnected.clone();
+    let control_writer = writer.clone();
+    let control_key = *key;
+    let mut control_reader = stream.try_clone()?;
+    thread::spawn(move || {
+        loop {
+            match read_message(&mut control_reader, 32) {
+                Ok((PONG, _)) => (),
+                Ok((SNAPSHOT_LIST, payload)) if payload.is_empty() => {
+                    let response = snapshots::list().map(|ids| {
+                        ids.into_iter()
+                            .flat_map(u64::to_be_bytes)
+                            .collect::<Vec<_>>()
+                    });
+                    let mut out = control_writer.lock().unwrap();
+                    match response {
+                        Ok(data) => {
+                            let _ = write_message(&mut *out, SNAPSHOT_LIST_REPLY, &data);
+                        }
+                        Err(_) => {
+                            let _ = write_message(&mut *out, SNAPSHOT_ERROR, &[]);
+                        }
+                    }
+                }
+                Ok((SNAPSHOT_GET, payload)) if payload.len() == 8 => {
+                    let id = u64::from_be_bytes(payload.try_into().unwrap());
+                    let response = snapshots::get(id, &control_key);
+                    let mut out = control_writer.lock().unwrap();
+                    match response {
+                        Ok(data) => {
+                            let _ = write_message(&mut *out, SNAPSHOT_FRAME, &data);
+                        }
+                        Err(_) => {
+                            let _ = write_message(&mut *out, SNAPSHOT_ERROR, &[]);
+                        }
+                    }
+                }
+                Ok((DISCONNECT, _)) | Err(_) => break,
+                _ => break,
+            }
+        }
+        control_disconnected.store(true, Ordering::SeqCst);
+    });
+
+    stream.set_read_timeout(None)?;
+    runtime.block_on(async {
+        let peer = Arc::new(api.new_peer_connection(RTCConfiguration::default()).await?);
+        let state_peer = peer.clone();
+        peer.on_ice_connection_state_change(Box::new(move |state| {
+            let state_peer = state_peer.clone();
+            Box::pin(async move {
+                log_error(&format!("WebRTC ICE state: {state}"));
+                if matches!(
+                    state,
+                    webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Connected
+                        | webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Completed
+                ) {
+                    let dtls = state_peer.sctp().transport();
+                    if let Some(pair) = dtls.ice_transport().get_selected_candidate_pair().await {
+                        log_error(&format!("WebRTC selected ICE pair: {pair}"));
+                    }
+                }
+            })
+        }));
+        peer.on_peer_connection_state_change(Box::new(|state| {
+            log_error(&format!("WebRTC peer state: {state}"));
+            Box::pin(async {})
+        }));
+        let (channel_tx, mut channel_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Arc<RTCDataChannel>>();
+        peer.on_data_channel(Box::new(move |channel| {
+            let tx = channel_tx.clone();
+            Box::pin(async move {
+                if channel.label() == "rv-frame-v1" {
+                    let opened_channel = channel.clone();
+                    channel.on_open(Box::new(move || {
+                        let _ = tx.send(opened_channel);
+                        Box::pin(async {})
+                    }));
+                }
+            })
+        }));
+        peer.set_remote_description(offer).await?;
+        let mut gathered = peer.gathering_complete_promise().await;
+        let answer = peer.create_answer(None).await?;
+        peer.set_local_description(answer).await?;
+        let _ = gathered.recv().await;
+        let local = peer
+            .local_description()
+            .await
+            .context("missing local WebRTC answer")?;
+        write_message(
+            &mut *writer.lock().unwrap(),
+            WEBRTC_ANSWER,
+            &serde_json::to_vec(&local)?,
+        )?;
+        let channel = tokio::time::timeout(Duration::from_secs(30), channel_rx.recv())
+            .await
+            .context("WebRTC data channel timed out")?
+            .context("WebRTC data channel closed")?;
+
+        let mut last_id = 0u64;
+        let mut last_tcp_ping = Instant::now();
+        while !disconnected.load(Ordering::SeqCst) {
+            // Keep the signaling/control TCP flow alive while frames travel over
+            // WebRTC UDP. Some firewalls expire an otherwise idle TCP mapping.
+            if last_tcp_ping.elapsed() >= Duration::from_secs(10) {
+                write_message(&mut *writer.lock().unwrap(), PING, &[])?;
+                last_tcp_ping = Instant::now();
+            }
+            match peer.connection_state() {
+                RTCPeerConnectionState::Disconnected
+                | RTCPeerConnectionState::Connecting
+                | RTCPeerConnectionState::New
+                | RTCPeerConnectionState::Unspecified => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+                    bail!("WebRTC peer entered {}", peer.connection_state())
+                }
+                RTCPeerConnectionState::Connected => (),
+            }
+            let frame = { latest.0.lock().unwrap().clone() };
+            if let Some(frame) = frame {
+                let id = u64::from_be_bytes(frame[..8].try_into()?);
+                if id != last_id {
+                    let width = u32::from_be_bytes(frame[8..12].try_into()?);
+                    let height = u32::from_be_bytes(frame[12..16].try_into()?);
+                    let jpeg_len = u32::from_be_bytes(frame[16..20].try_into()?);
+                    let chunk_size = 60 * 1024 - 28;
+                    let mut sent_frame = true;
+                    for (index, chunk) in frame[20..].chunks(chunk_size).enumerate() {
+                        // Back-pressure between chunks so a JPEG is never abandoned partway
+                        // through. The single latest-frame slot replaces stale captures.
+                        while channel.buffered_amount().await > 120_000
+                            && !disconnected.load(Ordering::SeqCst)
+                            && peer.connection_state() == RTCPeerConnectionState::Connected
+                        {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        if disconnected.load(Ordering::SeqCst) {
+                            sent_frame = false;
+                            break;
+                        }
+                        if peer.connection_state() != RTCPeerConnectionState::Connected {
+                            sent_frame = false;
+                            break;
+                        }
+                        let mut packet = Vec::with_capacity(28 + chunk.len());
+                        packet.extend_from_slice(b"RVF1");
+                        packet.extend_from_slice(&id.to_be_bytes());
+                        packet.extend_from_slice(&width.to_be_bytes());
+                        packet.extend_from_slice(&height.to_be_bytes());
+                        packet.extend_from_slice(&jpeg_len.to_be_bytes());
+                        packet.extend_from_slice(&((index * chunk_size) as u32).to_be_bytes());
+                        packet.extend_from_slice(chunk);
+                        if let Err(error) = channel.send(&Bytes::from(packet)).await {
+                            let state = peer.connection_state();
+                            log_error(&format!(
+                                "WebRTC data channel send failed at frame {id}, chunk {index}, peer state {state}: {error}"
+                            ));
+                            if matches!(
+                                state,
+                                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+                            ) {
+                                bail!("WebRTC data channel send failed in state {state}: {error}");
+                            }
+                            sent_frame = false;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            break;
+                        }
+                    }
+                    if sent_frame {
+                        last_id = id;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = peer.close().await;
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
 }
 
 fn main() -> Result<()> {

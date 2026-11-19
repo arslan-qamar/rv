@@ -91,6 +91,7 @@ Section "Install"
   nsExec::ExecToLog 'sc.exe delete RVHost'
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost"'
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost Discovery"'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost WebRTC"'
   Sleep 750
   SetOutPath "$INSTDIR"
   File "..\host\target\${BUILDTARGET}\release\RVHost.exe"
@@ -159,6 +160,13 @@ Section "Install"
     MessageBox MB_ICONSTOP "Could not add the discovery firewall rule."
     Abort
   ${EndIf}
+  ; WebRTC ICE uses a bounded UDP port range for LAN peer connections.
+  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="RVHost WebRTC" dir=in action=allow protocol=UDP localport=50000-50100 program="$INSTDIR\RVHost.exe" profile=any remoteip=localsubnet enable=yes'
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_ICONSTOP "Could not add the WebRTC LAN firewall rule."
+    Abort
+  ${EndIf}
   nsExec::ExecToLog 'sc.exe start RVHost'
   Pop $0
   ${If} $0 != 0
@@ -198,6 +206,7 @@ Section "Uninstall"
   nsExec::ExecToLog 'sc.exe delete RVHost'
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost"'
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost Discovery"'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="RVHost WebRTC"'
   Sleep 500
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RVHost"
   Delete "$INSTDIR\RVHost.exe"
