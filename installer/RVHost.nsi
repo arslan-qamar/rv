@@ -15,6 +15,7 @@ Var PortField
 Var PasswordField
 Var ConfirmField
 Var DeviceName
+Var ComputerName
 Var PortValue
 Var PasswordValue
 Var ConfirmValue
@@ -27,9 +28,10 @@ Page custom FinishPage
 Function ConfigurePage
   nsDialogs::Create 1018
   Pop $0
+  ReadEnvStr $ComputerName COMPUTERNAME
   ${NSD_CreateLabel} 0 0 100% 12u "Device name"
   Pop $0
-  ${NSD_CreateText} 0 14u 100% 13u "OFFICE-PC"
+  ${NSD_CreateText} 0 14u 100% 13u "$ComputerName"
   Pop $DeviceField
   ${NSD_CreateLabel} 0 32u 100% 12u "Port"
   Pop $0
@@ -84,6 +86,20 @@ Function ConfigureLeave
 FunctionEnd
 
 Section "Install"
+  ; MSVC builds depend on the Microsoft Visual C++ runtime. Install the
+  ; official x64 redistributable before launching either executable.
+  !if "${BUILDTARGET}" == "x86_64-pc-windows-msvc"
+    InitPluginsDir
+    SetOutPath "$PLUGINSDIR"
+    File "vc_redist.x64.exe"
+    ExecWait '"$PLUGINSDIR\vc_redist.x64.exe" /install /quiet /norestart' $0
+    ${If} $0 != 0
+    ${AndIf} $0 != 1638
+    ${AndIf} $0 != 3010
+      MessageBox MB_ICONSTOP "Microsoft Visual C++ Redistributable installation failed. Error code: $0"
+      Abort
+    ${EndIf}
+  !endif
   ; Permit repair/upgrade over an existing MVP installation.
   nsExec::ExecToLog 'sc.exe stop RVHost'
   nsExec::ExecToLog 'taskkill.exe /F /IM RVCapture.exe'

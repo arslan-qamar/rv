@@ -17,6 +17,14 @@ if (-not $MakeNsisPath) {
     throw 'NSIS makensis.exe was not found. Install NSIS or add it to PATH.'
 }
 
+$Redistributable = Join-Path $PSScriptRoot 'installer\vc_redist.x64.exe'
+Write-Host 'Downloading the latest Microsoft Visual C++ x64 Redistributable...'
+Invoke-WebRequest -Uri 'https://aka.ms/vc14/vc_redist.x64.exe' -OutFile $Redistributable
+if ((Get-Item $Redistributable).Length -lt 1MB) {
+    Remove-Item $Redistributable -Force
+    throw 'The Visual C++ Redistributable download was unexpectedly small.'
+}
+
 Set-Location "$PSScriptRoot\installer"
 & $MakeNsisPath RVHost.nsi
 if ($LASTEXITCODE -ne 0) { throw 'NSIS build failed' }
